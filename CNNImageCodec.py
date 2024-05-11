@@ -25,14 +25,15 @@ trainfolder = './train/'
 w=128
 h=128
 #If 0, then the training will be started, otherwise the model will be readed from a file
-LoadModel = 1
+LoadModel = 0
 #Training parameters
-batch_size = 10
+batch_size = 4
 #Number of bits for representation of the layers sample in the training process
-bt = 3
+bt = 2
 epochs = 3000
 #epochs = 100
 #Model parameters
+n0=256
 n1=128
 n2=32
 n3=16
@@ -41,7 +42,7 @@ n3=16
 NumImagesToShow = 5
 
 #Number of bits for representation of the layers sample
-b = 3
+b = 2
 
 #Compute PSNR in RGB domain
 def PSNR_RGB(image1,image2):
@@ -95,35 +96,48 @@ def LoadImagesFromFolder (foldername):
     return x
 
 #Model training function
+from tensorflow.keras.losses import Loss
+from skimage.metrics import structural_similarity as ssim
+
+#Model training function
 def ImageCodecModel(trainfolder):
     input = layers.Input(shape=(w, h, 3))
     # Encoder
-    e1 = layers.Conv2D(n1, (7, 7), activation="relu", padding="same")(input)
-    e1 = layers.MaxPooling2D((2, 2), padding="same")(e1)
-    e2 = layers.Conv2D(n2, (5, 5), activation="relu", padding="same")(e1)
-    e2 = layers.MaxPooling2D((2, 2), padding="same")(e2)
-    e3 = layers.Conv2D(n3, (3, 3), activation="relu", padding="same")(e2)
-    e3 = layers.MaxPooling2D((2, 2), padding="same")(e3)
+    e0 = layers.Conv2D(n1, (3, 3), strides=2, activation="gelu", padding="same")(input)
+
+    e1 = layers.Conv2D(n1, (3, 3), strides=2, activation="gelu", padding="same")(e0)
+
+    e2 = layers.Conv2D(n2, (3, 3), strides=2, activation="gelu", padding="same")(e1)
+
+    e3 = layers.Conv2D(n3, (3, 3), activation="gelu", padding="same")(e2)
+
+
     #add noise during training (needed for layer quantinzation)
     e3 = e3 + tensorflow.random.uniform(tensorflow.shape(e3), 0, tensorflow.math.reduce_max(e3)/pow(2, bt+1))
 
     # Decoder
-    x = layers.Conv2DTranspose(n3, (3, 3), strides=2, activation="relu", padding="same")(e3)
-    x = layers.Conv2DTranspose(n2, (5, 5), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2DTranspose(n1, (7, 7), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2D(3, (3, 3), activation="sigmoid", padding="same")(x)
+    d1 = layers.Conv2DTranspose(n3, (3, 3), activation="gelu", padding="same")(e3)
+
+    d2 = layers.Conv2DTranspose(n2, (3, 3), strides=2, activation="gelu", padding="same")(d1)
+
+    d3 = layers.Conv2DTranspose(n1, (3, 3), strides=2, activation="gelu", padding="same")(d2)
+
+    d4 = layers.Conv2DTranspose(n0, (3, 3), strides=2, activation="gelu", padding="same")(d3)
+
+    output = layers.Conv2D(3, (3, 3), activation="sigmoid", padding="same")(d4)
 
     # Autoencoder
     encoder = Model(input, e3)
-    decoder = Model(e3, x)
-    autoencoder = Model(input, x)
-    autoencoder.compile(optimizer="adam", loss='mean_squared_error')
+    decoder = Model(e3, output)
+    autoencoder = Model(input, output)
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
     autoencoder.summary()
 
     if LoadModel == 0:
         xtrain = LoadImagesFromFolder(trainfolder)
         xtrain = xtrain / 255
-        autoencoder.fit(xtrain, xtrain, epochs=epochs, batch_size=batch_size,shuffle=True)
+        autoencoder.fit(xtrain, xtrain, epochs=100, batch_size=batch_size,shuffle=True)
+
         autoencoder.save('autoencodertemp.mdl')
         encoder.save('encoder.mdl')
         decoder.save('decoder.mdl')
@@ -132,6 +146,7 @@ def ImageCodecModel(trainfolder):
         encoder = keras.models.load_model('encoder.mdl')
         decoder = keras.models.load_model('decoder.mdl')
     return encoder,decoder
+
 
 #Compresses input layer by multi-alphabet arithmetic coding using memoryless source model
 def EntropyEncoder (filename,enclayers,size_z,size_h,size_w):
@@ -208,24 +223,24 @@ if __name__ == '__main__':
     encoded_layers1 = numpy.clip(encoded_layers, 0, 0.9999999)
     encoded_layers1 = K.cast(encoded_layers1*pow(2, b), "int32")
 
-    #Encoding and decoding of each quantized layer by arithmetic coding
+    # Encoding and decoding of each quantized layer by arithmetic coding
     bpp = numpy.zeros(NumImagesToShow, numpy.float16, 'C')
-    declayers = numpy.zeros((NumImagesToShow,16, 16, 16), numpy.uint8, 'C')
+    declayers = numpy.zeros((NumImagesToShow, 16, 16, 32), numpy.uint8, 'C')
     for i in range(NumImagesToShow):
         binfilename = 'image%i.bin' % i
-        EntropyEncoder(binfilename, encoded_layers1[i], 16, 16, 16)
+        EntropyEncoder(binfilename, encoded_layers1[i], 16, 16, 32)
         bytesize = os.path.getsize(binfilename)
         bpp[i] = bytesize * 8 / (w * h)
-        declayers[i] = EntropyDecoder(binfilename,  16, 16, 16)
+        declayers[i] = EntropyDecoder(binfilename, 16, 16, 32)
 
-    #Dequantization and denormalization of each layer
+    # Dequantization and denormalization of each layer
     print(bpp)
-    shift = 1.0/pow(2, b+1)
+    shift = 1.0 / pow(2, b + 1)
     declayers = K.cast(declayers, "float32") / pow(2, b)
     declayers = declayers + shift
-    encoded_layers_quantized = numpy.zeros((NumImagesToShow, 16, 16, 16), numpy.double, 'C')
+    encoded_layers_quantized = numpy.zeros((NumImagesToShow, 16, 16, 32), numpy.double, 'C')
     for i in range(NumImagesToShow):
-        encoded_layers_quantized[i] = K.cast(declayers[i]*max_encoded_layers[i], "float32")
+        encoded_layers_quantized[i] = K.cast(declayers[i] * max_encoded_layers[i], "float32")
         encoded_layers[i] = K.cast(encoded_layers[i] * max_encoded_layers[i], "float32")
     decoded_imgs = decoder.predict(encoded_layers, batch_size=NumImagesToShow)
     decoded_imgsQ = decoder.predict(encoded_layers_quantized, batch_size=NumImagesToShow)
